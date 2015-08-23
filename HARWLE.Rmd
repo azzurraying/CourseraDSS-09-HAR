@@ -1,0 +1,166 @@
+---
+title: "Weight-Lifting Human Activity Prediction"
+output: html_document
+---
+
+### Introduction
+
+How well a person performs a weight-lifting exercise can be predicted by measuring physical parameters associated associated with the exercise. The following model is trained on variables measured from a weight-lifting exercise, and aims to predict the type of errors, if any, associated with performing the exercise (the variable "classe").
+
+### Download files and clean data
+
+The weight-lifting training and test data is downloaded. 
+``` {r, echo=FALSE, cache=TRUE}
+## Download
+setwd("/Users/yingjiang/Dropbox/Learnings/Stats_data/Coursework/Data_science_spec/Data_science_C8/Project")
+
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+              destfile = "pmltrain.csv", method = "curl")
+pmltrain <- read.csv("pmltrain.csv")
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+              destfile = "pmltest.csv", method = "curl")
+pmltest <- read.csv("pmltest.csv")
+
+## Clean
+# Remove the following columns:
+# - 1st 7 (contains user names and other non-numerical data)
+# - Blank columns ("")
+# - NA columns
+pmltrain1 <- pmltrain[-c(1:7, which(pmltrain[1, ] == ""), which(is.na(pmltrain[1, ])))]
+
+# Convert all to numeric and do correlation
+pmltrain2 <- as.data.frame(sapply(pmltrain1, as.numeric))
+
+pmltest1 <- pmltest[-c(1:7, which(pmltest[1, ] == ""), which(is.na(pmltest[1, ])))]
+pmltest2 <- as.data.frame(sapply(pmltest1, as.numeric))
+pmltest2$classe <- pmltest$classe
+
+colnames(pmltrain2)
+```
+The non-predictive variables (user IDs, etc) are removed from the dataset. There are `r ncol(pmltrain2)-1` predictors for the variable "classe", as listed above. These variables are all converted to numeric variables for analyses.
+
+### Explore the data
+
+First, a correlation matrix of all predictors is imaged. This approximates a pairs plot when the number of predictors to image is large.
+``` {r, cache=TRUE, echo=FALSE}
+## Explore
+# First, use correlation to generate a "pairs" plot
+M1 <- abs(cor(pmltrain2))
+diag(M1) <- 0
+image(M1, main = "Correlation matrix for weight-lifting exercise predictors and outcome")
+# Set pmltrain2's classe back to factor with levels A, B, C, D, E
+pmltrain2$classe <- pmltrain$classe
+# The last column represents the variable "classe"'s correlation with all predictors
+train_small <- pmltrain2[, c(which(M1[, ncol(M1)] > .1))]
+train_small$classe <- pmltrain$classe
+```
+
+The top row visually indicates the correlation of all predictors with "classe". There are `r ncol(train_small)-1` predictors that are relatively highly correlated with "classe", with correlation exceeding 0.1. Next, we examine the relationship among the predictors, to see if any further dimension reduction could take place.
+
+``` {r, cache=TRUE, echo=FALSE}
+# Correlation matrix among the predictors to further narrow down variables
+M2 <- abs(cor(train_small[, -16]))
+diag(M2) <- 0
+which(M2 > 0.8, arr.ind=T)
+```
+
+Out of the subset of `r ncol(train_small)-1` predictors, "accel_arm_x" is correlated to "magnet_arm_x"; and "magnet_arm_y" is correlated to "magnet_arm_z". The presence of highly correlated predictors indicate Principal Component Analysis could potentially be used to build a better model.
+
+### Build model
+
+The training data is spliced into 5 folds for cross-validation. To each of the validation sets, 4 models are built using:
+
+1. Decision Tree analysis applied to all predictor variables  
+2. Decision Tree analysis applied to the subset of predictors whose correlation with "classe" is higher than 0.1  
+3. Decision Tree analysis applied to all variables, with Principal Component Analysis  
+4. Decision Tree analysis applied to the subset of predictors whose correlation with "classe" is higher than 0.1, further taking out the predictors "accel_arm_x" and "magnet_arm_y"  
+
+``` {r, cache=TRUE, echo=FALSE}
+library(caret)
+library(e1071)
+library(party)
+# Splice data for k-fold cross-validation
+set.seed(9510)
+# Use 5 folds to get around 2000 samples in each fold
+folds <- createFolds(y = train_small$classe,
+                     k = 5,
+                     list = T,
+                     returnTrain = F)
+
+aFull <- numeric(5)
+aSel <- numeric(5)
+aPCA <- numeric(5)
+aSel2 <- numeric(5)
+
+for(i in 1:5) {
+  
+  # 1. Build models including all predictors (without feature selection)
+  # Use Decision Trees, without PCA
+  # Create validation folds
+  validation_full <- pmltrain2[-folds[[i]], ]
+  holdout_full <- pmltrain2[folds[[i]], ]
+  # Fit models
+  modelFit_DT_full <- ctree(classe ~ ., data = validation_full)
+  predicted_DT_full <- predict(modelFit_DT_full, newdata = holdout_full)
+  aFull[i] <- confusionMatrix(predicted_DT_full, holdout_full$classe)$overall[1]
+  
+  # 2. Include just the predictors that are relatively more correlated with classe.
+  # Use Decision Trees, without PCA
+  validation <- train_small[-folds[[i]], ]
+  holdout <- train_small[folds[[i]], ]
+  # Fit models
+  modelFit_DT <- ctree(classe ~ ., data = validation)
+  predicted_DT <- predict(modelFit_DT, newdata = holdout)
+  confusionMatrix(predicted_DT, holdout$classe)
+  # Get accuracy
+  aSel[i] <- confusionMatrix(predicted_DT, holdout$classe)$overall[1] # Note: this figure is exactly the same as predicted_DT_full!
+  
+  # 3. Build model with less predictors, with Decision Trees, including a PCA
+  # Note: 9 variables are needed to achieve 90% explanation of variance
+  preProc <- preProcess(validation[, -16], method = "pca", thresh = 0.9)
+  trainPC <- predict(preProc, validation[, -16])
+  # Fit models
+  modelFitPC <- ctree(validation$classe ~ ., data = trainPC)
+  testPC <- predict(preProc, holdout[, -16])
+  predictedPC <- predict(modelFitPC, testPC)
+  # Get accuracy
+  aPCA[i] <- confusionMatrix(predictedPC, holdout$classe)$overall[1] # 73% Accurate. Not as good as without using PCA!
+  
+  # 4. Build model with even less predictors, discarding "accel_arm_x" (correlated to magnet_arm_x) and magnet_arm_y (correlated to magnet_arm_z)
+  train_smaller <- train_small[-c(5, 7)]
+  validation_smaller <- train_small[-folds[[i]], ]
+  holdout_smaller <- train_small[folds[[i]], ]
+  # Fit models
+  modelFit_DT_sml <- ctree(classe ~ ., data = validation_smaller)
+  predicted_DT_sml <- predict(modelFit_DT_sml, newdata = holdout_smaller)
+  aSel2[i] <- confusionMatrix(predicted_DT_sml, holdout_smaller$classe)$overall[1] # Accuracy doesn't change much. Became slightly smaller.
+  
+}
+```
+
+Here're the prediction accuracies (True Positives and True Negatives predicted) for each of the 5 holdout sets:
+
+``` {r, cache=TRUE, echo=FALSE}
+plot(x = c(1:5), y = aFull, col = 1,
+     ylim = c(0.7, 1),
+     xlab = "Holdout set",
+     ylab = "Estimated out-of-sample accuracy")
+points(x = c(1:5), y = aSel, col = 2)
+points(x = c(1:5), y = aPCA, col = 3)
+legend(x = "topright",
+       pch = 1, col = c(1, 2, 3, 4),
+       legend = c("Model 1", "Model 2, 4", "Model 3"))
+```
+
+The average holdout set prediction accuracies for each of the models are:  
+1. **Model 1**: `r mean(aFull)`  
+2. **Model 2**: `r mean(aSel)`  
+3. **Model 3**: `r mean(aPCA)`  
+4. **Model 4**: `r mean(aSel2)`  
+
+The best accuracy is provided by Model 1, which takes into consideration of all the predictors in the dataset. This shows that, despite the fact that some of the predictors are not directly correlated with the outcome "classe", their interaction with other predictors cannot be ignored. Therefore, *Model 1* is chosen and applied once on the test dataset.
+
+``` {r, echo=FALSE, cache=TRUE}
+modelFit_DT_full <- ctree(classe ~ ., data = pmltrain2)
+predicted_DT_full <- predict(modelFit_DT_full, newdata = pmltest2)
+```
